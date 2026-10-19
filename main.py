@@ -1,258 +1,314 @@
+# Drop-in replacement for your notebook from the Word2Vec cell onward.
+# Keep: imports, loading the text, tokenization, and the train/val/test split.
+# Each "# %%" marks a notebook cell. Hyperparameters are all in cell 1.
+
+# %% Cell 1: settings
 import numpy as np
+import matplotlib.pyplot as plt
+from collections import Counter
 from gensim.models import Word2Vec
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
+from sklearn.model_selection import train_test_split
 
-with open("data/theverdict.txt", "r", encoding="utf-8") as file:
+WINDOW_SIZE = 5
+MIN_COUNT = 2  # train words seen fewer times become <unk>
+EMBED_SIZE = 100
+HIDDEN1 = 256
+HIDDEN2 = 256
+KEEP_PROB = 0.7  # dropout: keep 70% of units (set 1.0 to turn off)
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 0.1
+BATCH_SIZE = 128
+MAX_EPOCHS = 40
+PATIENCE = 3  # stop after this many epochs without val improvement
+
+
+with open("data/my_sweet_orange_tree.txt", "r", encoding="utf-8") as file:
     raw_text = file.read()
 
 nltk.download("punkt_tab")
 nltk.download("stopwords")
 nltk.download("wordnet")
 
+# Normalize curly apostrophes and quotation marks
+raw_text = raw_text.replace("’", "'").replace("‘", "'")
+raw_text = raw_text.replace("“", '"').replace("”", '"')
+
 sentences = sent_tokenize(raw_text.lower())
 tokenized_sentences = [word_tokenize(sentence) for sentence in sentences]
 
-print(f"sentences size: {len(sentences)}")
-print(f"token size: {len(tokenized_sentences)}")
+train_sentences, temp_sentences = train_test_split(
+    tokenized_sentences, test_size=0.2, random_state=42
+)
 
+val_sentences, test_sentences = train_test_split(
+    temp_sentences, test_size=0.5, random_state=42
+)
+
+
+# %% Cell 2: vocabulary with a real <unk> (built from TRAIN only)
+UNK_TOKEN = "<unk>"
+train_counts = Counter(w for s in train_sentences for w in s)
+
+vocab = [UNK_TOKEN] + [w for w, c in train_counts.most_common() if c >= MIN_COUNT]
+word_to_idx = {w: i for i, w in enumerate(vocab)}
+idx_to_word = {i: w for w, i in word_to_idx.items()}
+unk_idx = word_to_idx[UNK_TOKEN]
+VOCAB_SIZE = len(vocab)
+PAD_IDX = VOCAB_SIZE  # extra all-zero embedding row used for padding
+
+
+def to_unk(sentences):
+    return [[w if w in word_to_idx else UNK_TOKEN for w in s] for s in sentences]
+
+
+train_mapped = to_unk(train_sentences)
+val_mapped = to_unk(val_sentences)
+test_mapped = to_unk(test_sentences)
+
+print("Vocabulary size:", VOCAB_SIZE)
+
+# %% Cell 3: Word2Vec on the mapped train sentences -> embedding table
 embedding_model = Word2Vec(
-    sentences=tokenized_sentences,
-    vector_size=100,
+    sentences=train_mapped,
+    vector_size=EMBED_SIZE,
     window=5,
     min_count=1,
     sg=1,
     workers=4,
     epochs=10,
+    seed=42,
+)
+
+E = np.zeros((VOCAB_SIZE + 1, EMBED_SIZE), dtype=np.float32)
+for word, idx in word_to_idx.items():
+    E[idx] = embedding_model.wv[word]
+
+
+# %% Cell 4: build (context, target) data
+def create_dataset(mapped_sentences):
+    ctx_rows, targets = [], []
+    for sent in mapped_sentences:
+        ids = [word_to_idx[w] for w in sent]
+        for i in range(1, len(ids)):
+            ctx = ids[max(0, i - WINDOW_SIZE) : i]
+            ctx = [PAD_IDX] * (WINDOW_SIZE - len(ctx)) + ctx
+            ctx_rows.append(ctx)
+            targets.append(ids[i])
+    ctx_idx = np.array(ctx_rows, dtype=np.int64)
+    X = E[ctx_idx].reshape(len(ctx_idx), -1)  # (n, WINDOW_SIZE * EMBED_SIZE)
+    return X, np.array(targets, dtype=np.int64)
+
+
+X_train, y_train = create_dataset(train_mapped)
+X_val, y_val = create_dataset(val_mapped)
+X_test, y_test = create_dataset(test_mapped)
+
+print("X_train:", X_train.shape, "X_val:", X_val.shape, "X_test:", X_test.shape)
+print(
+    f"<unk> targets  train: {np.mean(y_train == unk_idx):.2%}  "
+    f"val: {np.mean(y_val == unk_idx):.2%}  test: {np.mean(y_test == unk_idx):.2%}"
 )
 
 
-WINDOW_SIZE = 3
-EMBED_SIZE = embedding_model.wv.vector_size
-
-
-def create_sequence(sentences, window_size=WINDOW_SIZE):
-    pairs = []
-
-    for sentence in sentences:
-        for i in range(1, len(sentence)):
-            context = sentence[max(0, i - window_size) : i]
-            target = sentence[i]
-            pairs.append((context, target))
-
-    return pairs
-
-
-def context_to_vector(context, embedding_model):
-    context = context[-WINDOW_SIZE:]
-
-    vectors = [
-        embedding_model.wv[word] if word in embedding_model.wv else np.zeros(EMBED_SIZE)
-        for word in context
-    ]
-
-    # Pad missing positions on the left
-    while len(vectors) < WINDOW_SIZE:
-        vectors.insert(0, np.zeros(EMBED_SIZE))
-
-    return np.concatenate(vectors)
-
-
-pairs = create_sequence(tokenized_sentences)
-
-word_to_idx = {word: idx for idx, word in enumerate(embedding_model.wv.index_to_key)}
-idx_to_word = {idx: word for word, idx in word_to_idx.items()}
-X = np.array([context_to_vector(context, embedding_model) for context, target in pairs])
-y = np.array([target for _, target in pairs])
-
-y = np.array([word_to_idx[word] for word in y])
-print(f"X shape: {X.shape}")
-print(f"y shape: {y.shape}")
-
-
-def onehot(Y):
-    return np.eye(len(word_to_idx))[Y]
-
-
-# relu
+# %% Cell 5: the network (with dropout)
 def relu(Z):
     return np.maximum(0, Z)
 
 
-# softmax
 def softmax(Z):
-    exp_z = np.exp(Z - np.max(Z, axis=1, keepdims=True))
-    return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+    e = np.exp(Z - np.max(Z, axis=1, keepdims=True))
+    return e / np.sum(e, axis=1, keepdims=True)
 
 
-def initialize_parameters(
-    input_size, hiddenLayer1_size, hiddenLayer2_size, output_size
-):
-    np.random.seed(42)
+def initialize_parameters(n_in, n_h1, n_h2, n_out, seed=42):
+    rng = np.random.default_rng(seed)
 
-    parameters = {
-        "w1": np.random.randn(input_size, hiddenLayer1_size) * np.sqrt(2 / input_size),
-        "b1": np.zeros((1, hiddenLayer1_size)),
-        "w2": np.random.randn(hiddenLayer1_size, hiddenLayer2_size)
-        * np.sqrt(2 / hiddenLayer1_size),
-        "b2": np.zeros((1, hiddenLayer2_size)),
-        "w3": np.random.randn(hiddenLayer2_size, output_size)
-        * np.sqrt(2 / hiddenLayer2_size),
-        "b3": np.zeros((1, output_size)),
+    def he(a, b):
+        return (rng.standard_normal((a, b)) * np.sqrt(2 / a)).astype(np.float32)
+
+    return {
+        "w1": he(n_in, n_h1),
+        "b1": np.zeros((1, n_h1), dtype=np.float32),
+        "w2": he(n_h1, n_h2),
+        "b2": np.zeros((1, n_h2), dtype=np.float32),
+        "w3": he(n_h2, n_out),
+        "b3": np.zeros((1, n_out), dtype=np.float32),
     }
 
-    return parameters
+
+def dropout_mask(shape, keep_prob):
+    return ((np.random.rand(*shape) < keep_prob) / keep_prob).astype(np.float32)
 
 
-def forward_propagation(X, parameters):
-    w1, b1, w2, b2, w3, b3 = (
-        parameters["w1"],
-        parameters["b1"],
-        parameters["w2"],
-        parameters["b2"],
-        parameters["w3"],
-        parameters["b3"],
-    )
-
-    # first layer
-    Z1 = np.dot(X, w1) + b1
+def forward_propagation(X, p, keep_prob=1.0):
+    Z1 = X @ p["w1"] + p["b1"]
     A1 = relu(Z1)
+    D1 = None
+    if keep_prob < 1.0:
+        D1 = dropout_mask(A1.shape, keep_prob)
+        A1 = A1 * D1
 
-    # second layer
-    Z2 = np.dot(A1, w2) + b2
+    Z2 = A1 @ p["w2"] + p["b2"]
     A2 = relu(Z2)
+    D2 = None
+    if keep_prob < 1.0:
+        D2 = dropout_mask(A2.shape, keep_prob)
+        A2 = A2 * D2
 
-    # output layer
-    Z3 = np.dot(A2, w3) + b3
-    A3 = softmax(Z3)
-
-    cache = {
-        "Z1": Z1,
-        "A1": A1,
-        "Z2": Z2,
-        "A2": A2,
-        "Z3": Z3,
-        "A3": A3,
-    }
-
-    return A3, cache
+    A3 = softmax(A2 @ p["w3"] + p["b3"])
+    return A3, {"Z1": Z1, "A1": A1, "D1": D1, "Z2": Z2, "A2": A2, "D2": D2, "A3": A3}
 
 
 def compute_cost(Y, A3):
     m = Y.shape[0]
-
-    correct_prob = np.clip(A3[np.arange(m), Y], 1e-12, 1.0)
-
-    L = -1 / m * np.sum(np.log(correct_prob))
-
-    return L
+    correct = np.clip(A3[np.arange(m), Y], 1e-12, 1.0)
+    return -np.mean(np.log(correct))
 
 
-def backpropagation(w1, b1, w2, b2, w3, b3, cache, X, Y):
+def backpropagation(p, cache, X, Y):
     m = Y.shape[0]
+    # softmax + cross-entropy, without building a one-hot matrix
+    dZ3 = cache["A3"].copy()
+    dZ3[np.arange(m), Y] -= 1
+    dW3 = cache["A2"].T @ dZ3 / m
+    db3 = dZ3.sum(axis=0, keepdims=True) / m
 
-    Z1, A1 = cache["Z1"], cache["A1"]
-    Z2, A2 = cache["Z2"], cache["A2"]
-    A3 = cache["A3"]
+    dA2 = dZ3 @ p["w3"].T
+    if cache["D2"] is not None:
+        dA2 = dA2 * cache["D2"]
+    dZ2 = dA2 * (cache["Z2"] > 0)
+    dW2 = cache["A1"].T @ dZ2 / m
+    db2 = dZ2.sum(axis=0, keepdims=True) / m
 
-    # Output layer: softmax + cross-entropy
-    dZ3 = A3 - onehot(Y)
-    # dZ3 = A3.copy()
-    # dZ3[np.arange(len(Y)), Y] -= 1
-    dW3 = A2.T @ dZ3 / m
-    db3 = np.sum(dZ3, axis=0, keepdims=True) / m
-
-    # Hidden layer 2: ReLU
-    dA2 = dZ3 @ w3.T
-    dZ2 = dA2 * (Z2 > 0)
-    dW2 = A1.T @ dZ2 / m
-    db2 = np.sum(dZ2, axis=0, keepdims=True) / m
-
-    # Hidden layer 1: ReLU
-    dA1 = dZ2 @ w2.T
-    dZ1 = dA1 * (Z1 > 0)
+    dA1 = dZ2 @ p["w2"].T
+    if cache["D1"] is not None:
+        dA1 = dA1 * cache["D1"]
+    dZ1 = dA1 * (cache["Z1"] > 0)
     dW1 = X.T @ dZ1 / m
-    db1 = np.sum(dZ1, axis=0, keepdims=True) / m
+    db1 = dZ1.sum(axis=0, keepdims=True) / m
 
-    return dW1, db1, dW2, db2, dW3, db3
-
-
-import numpy as np
-
-# Start with fresh parameters
-params = initialize_parameters(X.shape[1], 128, 128, len(word_to_idx))
-print("X:", X.shape)
-print("w1:", params["w1"].shape)
-print("b1:", params["b1"].shape)
-print("w2:", params["w2"].shape)
-print("b2:", params["b2"].shape)
-print("w3:", params["w3"].shape)
-print("b3:", params["b3"].shape)
+    return {"w1": dW1, "b1": db1, "w2": dW2, "b2": db2, "w3": dW3, "b3": db3}
 
 
-# Adam settings
-learning_rate = 0.001
-beta1 = 0.9
-beta2 = 0.999
-epsilon = 1e-8
-weight_decay = 0.01
+def evaluate(X, y, p, batch_size=1024):
+    total_loss, correct = 0.0, 0
+    for s in range(0, len(X), batch_size):
+        probs, _ = forward_propagation(X[s : s + batch_size], p)  # no dropout
+        yb = y[s : s + batch_size]
+        total_loss += compute_cost(yb, probs) * len(yb)
+        correct += np.sum(np.argmax(probs, axis=1) == yb)
+    return total_loss / len(X), correct / len(X)
 
-keys = ["w1", "b1", "w2", "b2", "w3", "b3"]
 
-m = {k: np.zeros_like(params[k]) for k in keys}
-v = {k: np.zeros_like(params[k]) for k in keys}
+# %% Cell 6: training with Adam, per-epoch validation, early stopping
+params = initialize_parameters(X_train.shape[1], HIDDEN1, HIDDEN2, VOCAB_SIZE)
+keys = list(params.keys())
+m_adam = {k: np.zeros_like(v) for k, v in params.items()}
+v_adam = {k: np.zeros_like(v) for k, v in params.items()}
+beta1, beta2, eps = 0.9, 0.999, 1e-8
 
-costs = []
-epochs = 1000
+train_losses, val_losses, val_accs = [], [], []
+best_val, best_params, bad_epochs, step = np.inf, None, 0, 0
 
-for epoch in range(1, epochs + 1):
-    A3, cache = forward_propagation(X, params)
-    cost = compute_cost(y, A3)
-    costs.append(cost)
+for epoch in range(1, MAX_EPOCHS + 1):
+    order = np.random.permutation(len(X_train))
+    for start in range(0, len(X_train), BATCH_SIZE):
+        b = order[start : start + BATCH_SIZE]
+        Xb, yb = X_train[b], y_train[b]
 
-    grads = backpropagation(
-        params["w1"],
-        params["b1"],
-        params["w2"],
-        params["b2"],
-        params["w3"],
-        params["b3"],
-        cache,
-        X,
-        y,
+        A3, cache = forward_propagation(Xb, params, KEEP_PROB)
+        grads = backpropagation(params, cache, Xb, yb)
+
+        step += 1
+        for k in keys:
+            m_adam[k] = beta1 * m_adam[k] + (1 - beta1) * grads[k]
+            v_adam[k] = beta2 * v_adam[k] + (1 - beta2) * grads[k] ** 2
+            m_hat = m_adam[k] / (1 - beta1**step)
+            v_hat = v_adam[k] / (1 - beta2**step)
+            if k.startswith("w"):  # decay weights, not biases
+                params[k] *= 1 - LEARNING_RATE * WEIGHT_DECAY
+            params[k] -= LEARNING_RATE * m_hat / (np.sqrt(v_hat) + eps)
+
+    # evaluate WITHOUT dropout so train/val numbers are comparable
+    tr_loss, tr_acc = evaluate(X_train, y_train, params)
+    va_loss, va_acc = evaluate(X_val, y_val, params)
+    train_losses.append(tr_loss)
+    val_losses.append(va_loss)
+    val_accs.append(va_acc)
+    print(
+        f"Epoch {epoch:2d} | train loss {tr_loss:.3f} acc {tr_acc:.3f} "
+        f"| val loss {va_loss:.3f} acc {va_acc:.3f}"
     )
 
-    grads = dict(zip(keys, grads))
+    if va_loss < best_val:
+        best_val, bad_epochs = va_loss, 0
+        best_params = {k: v.copy() for k, v in params.items()}
+    else:
+        bad_epochs += 1
+        if bad_epochs >= PATIENCE:
+            print(f"Early stopping: no improvement for {PATIENCE} epochs.")
+            break
 
-    for k in keys:
-        m[k] = beta1 * m[k] + (1 - beta1) * grads[k]
-        v[k] = beta2 * v[k] + (1 - beta2) * grads[k] ** 2
+params = best_params  # roll back to the best epoch
+print(f"Restored best weights (val loss {best_val:.3f})")
 
-        m_hat = m[k] / (1 - beta1**epoch)
-        v_hat = v[k] / (1 - beta2**epoch)
+# %% Cell 7: learning curves + final numbers
+plt.plot(train_losses, label="train")
+plt.plot(val_losses, label="validation")
+plt.xlabel("epoch")
+plt.ylabel("loss")
+plt.legend()
+plt.show()
 
-        # adaptive learning rate
-        # params[k] -= learning_rate * m_hat / (
-        #     np.sqrt(v_hat) + epsilon
-        # )
-        # apply weight decay only on weights matrices
-        if k in ["w1", "w2", "w3"]:
-            params[k] *= 1 - learning_rate * weight_decay
-        params[k] -= learning_rate * m_hat / (np.sqrt(v_hat) + epsilon)
+for name, X_, y_ in [
+    ("train", X_train, y_train),
+    ("val", X_val, y_val),
+    ("test", X_test, y_test),
+]:
+    loss, acc = evaluate(X_, y_, params)
+    known = y_ != unk_idx
+    k_loss, k_acc = evaluate(X_[known], y_[known], params)
+    print(
+        f"{name:5s} loss {loss:.3f} acc {acc:.3f} | excluding <unk>: loss {k_loss:.3f} acc {k_acc:.3f}"
+    )
 
-    if epoch == 1 or epoch % 100 == 0:
-        print(f"Epoch {epoch}: loss = {cost:.4f}")
 
-# Evaluate training accuracy
-A3, _ = forward_propagation(X, params)
-predictions = np.argmax(A3, axis=1)
+# %% Cell 8: prediction and generation (full 5-word context + sampling)
+def context_to_input(words):
+    ids = [word_to_idx.get(w, unk_idx) for w in words][-WINDOW_SIZE:]
+    ids = [PAD_IDX] * (WINDOW_SIZE - len(ids)) + ids
+    return E[ids].reshape(1, -1)
 
-print("Training accuracy:", np.mean(predictions == y))
 
-unique, counts = np.unique(predictions, return_counts=True)
-top = np.argsort(counts)[::-1][:10]
+def next_word_probs(words):
+    probs, _ = forward_propagation(context_to_input(words), params)
+    return probs[0]
 
-print("\nMost predicted words:")
-for i in top:
-    idx = unique[i]
-    print(f"{idx_to_word[idx]}: {counts[i]} ({counts[i]/len(y):.1%})")
+
+def show_top_predictions(context, top_n=5):
+    words = context.lower().split()
+    probs = next_word_probs(words)
+    print(f"\nContext: {context}")
+    for idx in np.argsort(probs)[::-1][:top_n]:
+        print(f"{idx_to_word[idx]:<12} {probs[idx]:.4f}")
+
+
+def generate_text(start_text, num_words=50, temperature=0.8, top_k=20):
+    words = start_text.lower().split()
+    for _ in range(num_words):
+        probs = next_word_probs(words[-WINDOW_SIZE:]).astype(np.float64)
+        probs[unk_idx] = 0.0  # never emit <unk>
+        top = np.argsort(probs)[::-1][:top_k]  # keep only top-k words
+        p = probs[top] ** (1.0 / temperature)
+        p /= p.sum()
+        words.append(idx_to_word[int(np.random.choice(top, p=p))])
+    return " ".join(words)
+
+
+show_top_predictions("the")
+show_top_predictions("he was")
+show_top_predictions("it was a")
+print()
+print(generate_text("it was a", 30))
